@@ -5,9 +5,12 @@ import type { LayoutItem } from "react-grid-layout";
 import type { AlertCfg, StartApp } from "./api";
 
 const disk = new LazyStore("halo-settings.json");
+// Never write before the saved settings have loaded: an early write would replace them with defaults.
+let settingsLoaded = false;
 const tauriStorage: StateStorage = {
   getItem: async (k) => ((await disk.get<string>(k)) ?? null),
   setItem: async (k, v) => {
+    if (!settingsLoaded) return;
     await disk.set(k, v);
     await disk.save();
   },
@@ -148,6 +151,7 @@ export const useSettings = create<Settings>()(
         return old;
       },
       storage: createJSONStorage(() => tauriStorage),
+      onRehydrateStorage: () => (_state, error) => { if (!error) settingsLoaded = true; },
       partialize: ({ set: _s, ...rest }) => rest,
     },
   ),

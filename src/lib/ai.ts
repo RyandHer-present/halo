@@ -13,9 +13,11 @@ import { useLive } from "./live";
 
 // ---------------- persisted state ----------------
 const disk = new LazyStore("halo-ai.json");
+// no writes until saved chats have loaded (an early write would wipe them)
+let aiLoaded = false;
 const storage: StateStorage = {
   getItem: async (k) => ((await disk.get<string>(k)) ?? null),
-  setItem: async (k, v) => { await disk.set(k, v); await disk.save(); },
+  setItem: async (k, v) => { if (!aiLoaded) return; await disk.set(k, v); await disk.save(); },
   removeItem: async (k) => { await disk.delete(k); await disk.save(); },
 };
 
@@ -59,6 +61,7 @@ export const useAi = create<AiState>()(
       name: "ai",
       version: 1,
       storage: createJSONStorage(() => storage),
+      onRehydrateStorage: () => (_state, error) => { if (!error) aiLoaded = true; },
       partialize: (s) => ({ chats: s.chats.slice(0, 60), currentId: s.currentId, memory: s.memory, log: s.log.slice(0, 200) }) as any,
     },
   ),
@@ -611,6 +614,84 @@ function gemType(p: Param): any {
   return o;
 }
 
+// ---- resilient Gemini calls: timeout, then fall back through other working models ----
+let workingModel: { name: string; at: number } | null = null;
+let modelCache: { key: string; list: string[]; at: number } | null = null;
+
+/** Ping the top-ranked models in parallel with a tiny request; keep the ones that answer, best first. */
+async function probeModels(key: string): Promise<string[]> {
+  const ranked = rankModels(await listGeminiModels(key)).slice(0, 12);
+  const ok = await Promise.all(ranked.map(async (m) => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 10_000);
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+        method: "POST", signal: ctl.signal,
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }], generationConfig: { maxOutputTokens: 8 } }),
+      });
+      return r.ok;
+    } catch { return false; } finally { clearTimeout(t); }
+  }));
+  return ranked.filter((_, i) => ok[i]);
+}
+
+async function fallbackModels(key: string, first: string): Promise<string[]> {
+  if (modelCache?.key !== key || Date.now() - modelCache.at > 3 * 3600_000 || !modelCache.list.length) {
+    useAi.setState({ status: "Finding the fastest Gemini model…" } as any);
+    try { modelCache = { key, list: await probeModels(key), at: Date.now() }; } catch { modelCache = null; }
+  }
+  const good = modelCache?.list ?? [];
+  const recent = workingModel && Date.now() - workingModel.at < 30 * 60_000 ? [workingModel.name] : [];
+  const pref = good.includes(first) ? [first] : [];
+  const list = [...new Set([...recent, ...pref, ...good])];
+  return (list.length ? list : [first]).slice(0, 4);
+}
+
+/** POST to Gemini, trying the next model when one is overloaded, out of quota, retired or hangs. */
+async function gemCall(key: string, first: string, body: any, timeoutMs = 40_000): Promise<{ j: any; model: string }> {
+  let lastErr = "Gemini didn't answer";
+  for (const model of await fallbackModels(key, first)) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) {
+        workingModel = { name: model, at: Date.now() };
+        const st = useSettings.getState();
+        if (st.ai.geminiModel !== model) st.set({ ai: { ...st.ai, geminiModel: model } });
+        return { j, model };
+      }
+      lastErr = j?.error?.message ?? `Gemini error ${r.status}`;
+      // a bad request or bad key won't get better on another model
+      if (![404, 429, 500, 503, 504].includes(r.status)) throw new Error(lastErr);
+    } catch (e: any) {
+      if (e?.name !== "AbortError" && !(e instanceof TypeError)) throw e;
+      lastErr = e?.name === "AbortError" ? `${model} took too long to answer` : "Couldn't reach Gemini — check your internet";
+    } finally {
+      clearTimeout(t);
+    }
+    if (workingModel?.name === model) workingModel = null;
+    if (modelCache) modelCache.list = modelCache.list.filter((x) => x !== model);
+    useAi.setState({ status: `${model} is busy — trying another model…` } as any);
+  }
+  throw new Error(`${lastErr}. Try again in a minute.`);
+}
+
+function rankModels(ms: string[]) {
+  const score = (n: string) => {
+    const v = parseFloat(n.match(/gemini-(d+(?:.d+)?)/)?.[1] ?? "0");
+    return v * 10 + (n.includes("flash") ? 3 : 0) - (n.includes("lite") ? 2 : 0) - (/preview|exp/.test(n) ? 1 : 0) - (/latest/.test(n) ? 30 : 0);
+  };
+  return ms.filter((n) => !/(robotics|transcribe|computer-use|nano|customtools|omni|banana)/.test(n)).sort((a, b) => score(b) - score(a));
+}
+
 async function gemini(history: Turn[], onCall: (c: ToolCall) => void): Promise<string> {
   const { geminiKey, geminiModel } = useSettings.getState().ai;
   if (!geminiKey) throw new Error("Add a Gemini API key in the assistant's setup first.");
@@ -625,13 +706,7 @@ async function gemini(history: Turn[], onCall: (c: ToolCall) => void): Promise<s
     parts: [...(h.image ? [{ inlineData: { mimeType: "image/png", data: h.image.split(",")[1] } }] : []), { text: h.text || "(image)" }],
   }));
   for (let i = 0; i < 20; i++) {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": geminiKey },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: systemPrompt() }] }, contents, tools: [{ functionDeclarations: decls }] }),
-    });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j?.error?.message ?? `Gemini error ${r.status}`);
+    const { j } = await gemCall(geminiKey, model, { systemInstruction: { parts: [{ text: systemPrompt() }] }, contents, tools: [{ functionDeclarations: decls }] });
     const cand = j.candidates?.[0];
     const parts: any[] = cand?.content?.parts ?? [];
     const calls = parts.filter((p) => p.functionCall);
@@ -717,12 +792,7 @@ export async function listGeminiModels(key: string): Promise<string[]> {
 
 async function pickGeminiModel(key: string) {
   try {
-    const ms = await listGeminiModels(key);
-    const score = (n: string) => {
-      const v = parseFloat(n.match(/gemini-(\d+(?:\.\d+)?)/)?.[1] ?? "0");
-      return v * 10 + (n.includes("flash") ? 3 : 0) - (n.includes("lite") ? 2 : 0) - (/preview|exp/.test(n) ? 1 : 0);
-    };
-    const best = ms.sort((a, b) => score(b) - score(a))[0];
+    const best = rankModels(await listGeminiModels(key))[0];
     if (best) {
       const s = useSettings.getState();
       s.set({ ai: { ...s.ai, geminiModel: best } });
@@ -796,13 +866,7 @@ export async function transcribe(blob: Blob): Promise<string> {
   if (!geminiKey) throw new Error("Voice input needs a Gemini API key (free) — add one in the assistant setup.");
   const b64 = await new Promise<string>((res) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.readAsDataURL(blob); });
   const model = geminiModel || (await pickGeminiModel(geminiKey));
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": geminiKey },
-    body: JSON.stringify({ contents: [{ role: "user", parts: [{ inlineData: { mimeType: blob.type || "audio/webm", data: b64 } }, { text: "Transcribe this speech exactly. Reply with only the transcript, nothing else. If there's no speech, reply with an empty string." }] }] }),
-  });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j?.error?.message ?? "transcription failed");
+  const { j } = await gemCall(geminiKey, model, { contents: [{ role: "user", parts: [{ inlineData: { mimeType: blob.type || "audio/webm", data: b64 } }, { text: "Transcribe this speech exactly. Reply with only the transcript, nothing else. If there's no speech, reply with an empty string." }] }] }, 30_000);
   return (j.candidates?.[0]?.content?.parts ?? []).map((p: any) => p.text ?? "").join("").trim();
 }
 
