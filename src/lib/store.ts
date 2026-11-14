@@ -45,6 +45,11 @@ export interface AiCfg {
   claudeModel: string;
   speak: boolean;
   voice: string;
+  ttsEngine: "windows" | "groq" | "fish";
+  groqKey: string;
+  groqVoice: string;
+  fishKey: string;
+  fishVoice: string;
 }
 
 export const DEFAULT_LAYOUT: LayoutItem[] = [
@@ -130,7 +135,7 @@ export const useSettings = create<Settings>()(
       todos: [],
       notes: "",
       events: [],
-      ai: { provider: "gemini", geminiKey: "", claudeKey: "", geminiModel: "", claudeModel: "claude-opus-5-5", speak: true, voice: "" },
+      ai: { provider: "gemini", geminiKey: "", claudeKey: "", geminiModel: "", claudeModel: "claude-opus-5-5", speak: true, voice: "", ttsEngine: "windows", groqKey: "", groqVoice: "daniel", fishKey: "", fishVoice: "" },
       alerts: { cpu_temp: 95, gpu_temp: 87, disk_free_pct: 8, hog_cpu: 70, net_down: true },
       organizer: { enabled: false, clean_installers: false },
       schedules: [],

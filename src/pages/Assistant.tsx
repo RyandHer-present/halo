@@ -3,7 +3,7 @@ import { Bot, Brain, Camera, Check, ChevronDown, History, KeyRound, Mic, Plus, R
 import { useEffect, useRef, useState } from "react";
 import { Card, Empty, IconBtn, Segmented, Switch } from "../components/ui";
 import { api } from "../lib/api";
-import { ask, ChatMsg, finishVoice, listGeminiModels, newChat, startRecording, stopSpeaking, ToolCall, undo, useAi, useVoice } from "../lib/ai";
+import { ask, ChatMsg, finishVoice, listGeminiModels, newChat, startRecording, stopSpeaking, testVoice, ToolCall, undo, useAi, useVoice } from "../lib/ai";
 import { toast, useSettings, useUi } from "../lib/store";
 import { sfx } from "../lib/util";
 
@@ -129,6 +129,7 @@ function Setup({ onClose }: { onClose?: () => void }) {
   const set = useSettings((s) => s.set);
   const [models, setModels] = useState<string[]>([]);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [voiceMsg, setVoiceMsg] = useState("");
   const upd = (p: Partial<typeof ai>) => set({ ai: { ...useSettings.getState().ai, ...p } });
   useEffect(() => {
     if (ai.geminiKey) listGeminiModels(ai.geminiKey).then(setModels).catch(() => setModels([]));
@@ -176,7 +177,55 @@ function Setup({ onClose }: { onClose?: () => void }) {
           <div><div className="set-label">Speak replies</div><div className="faint small">Read answers out loud</div></div>
           <Switch on={ai.speak} onChange={(v) => upd({ speak: v })} />
         </div>
-        {ai.speak && voices.length > 0 && (
+        {ai.speak && (
+          <div className="set-row">
+            <div><div className="set-label">Voice engine</div><div className="faint small">Verity = Groq's "Daniel" voice (free key). Fish Audio = any voice model from fish.audio.</div></div>
+            <Segmented value={ai.ttsEngine ?? "windows"} onChange={(v) => { upd({ ttsEngine: v }); setVoiceMsg(""); }} options={[{ id: "windows", label: "Windows" }, { id: "groq", label: "Verity" }, { id: "fish", label: "Fish Audio" }]} />
+          </div>
+        )}
+        {ai.speak && ai.ttsEngine === "fish" && (
+          <>
+            <label className="field">
+              <span>Fish Audio API key <a className="link-btn" onClick={() => api.launchPath("https://fish.audio/app/api-keys/")}>get one →</a></span>
+              <input className="input no-drag" type="password" value={ai.fishKey ?? ""} placeholder="Fish Audio API key" onChange={(e) => { upd({ fishKey: e.target.value.trim() }); setVoiceMsg(""); }} />
+            </label>
+            <div className="set-row">
+              <label className="field" style={{ flex: 1 }}>
+                <span>Voice model ID or link <a className="link-btn" onClick={() => api.launchPath("https://fish.audio/discovery/")}>browse voices →</a></span>
+                <input className="input no-drag" value={ai.fishVoice ?? ""} placeholder="https://fish.audio/m/…" onChange={(e) => { upd({ fishVoice: e.target.value.trim() }); setVoiceMsg(""); }} />
+              </label>
+              <button className="pill accent-pill" disabled={!ai.fishKey || !ai.fishVoice || voiceMsg === "Testing…"} onClick={async () => {
+                setVoiceMsg("Testing…");
+                try { await testVoice("fish", ai.fishKey, ai.fishVoice); setVoiceMsg("Works"); }
+                catch (e) { setVoiceMsg(String((e as Error).message ?? e)); }
+              }}>Test voice</button>
+            </div>
+            {voiceMsg && <div className="faint small">{voiceMsg}</div>}
+          </>
+        )}
+        {ai.speak && ai.ttsEngine === "groq" && (
+          <>
+            <label className="field">
+              <span>Groq API key <a className="link-btn" onClick={() => api.launchPath("https://console.groq.com/keys")}>get one free →</a></span>
+              <input className="input no-drag" type="password" value={ai.groqKey ?? ""} placeholder="gsk_…" onChange={(e) => { upd({ groqKey: e.target.value.trim() }); setVoiceMsg(""); }} />
+            </label>
+            <div className="set-row">
+              <label className="field" style={{ flex: 1 }}>
+                <span>Groq voice</span>
+                <select className="input" value={ai.groqVoice || "daniel"} onChange={(e) => upd({ groqVoice: e.target.value })}>
+                  {["daniel", "austin", "troy", "autumn", "diana", "hannah"].map((v) => <option key={v} value={v}>{v === "daniel" ? "Daniel (Verity)" : v[0].toUpperCase() + v.slice(1)}</option>)}
+                </select>
+              </label>
+              <button className="pill accent-pill" disabled={!ai.groqKey || voiceMsg === "Testing…"} onClick={async () => {
+                setVoiceMsg("Testing…");
+                try { await testVoice("groq", ai.groqKey,ai.groqVoice || "daniel"); setVoiceMsg("Works"); }
+                catch (e) { setVoiceMsg(String((e as Error).message ?? e)); }
+              }}>Test voice</button>
+            </div>
+            {voiceMsg && <div className="faint small">{voiceMsg}{/terms|accept/i.test(voiceMsg) && <> — <a className="link-btn" onClick={() => api.launchPath("https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english")}>accept the model terms here</a>, then test again.</>}</div>}
+          </>
+        )}
+        {ai.speak && (ai.ttsEngine ?? "windows") === "windows" && voices.length > 0 && (
           <label className="field">
             <span>Voice</span>
             <select className="input" value={ai.voice} onChange={(e) => upd({ voice: e.target.value })}>
@@ -185,7 +234,7 @@ function Setup({ onClose }: { onClose?: () => void }) {
             </select>
           </label>
         )}
-        <div className="faint small">Push-to-talk anywhere: hold <span className="kbd">Ctrl + Shift + Space</span>. Voice uses your Gemini key to transcribe.</div>
+        <div className="faint small" style={{ marginTop: 4 }}>Push-to-talk anywhere: hold <span className="kbd">Ctrl + Shift + Space</span>. Voice uses your Gemini key to transcribe.</div>
       </div>
     </Card>
   );

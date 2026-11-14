@@ -845,20 +845,139 @@ export async function ask(prompt: string, opts: { image?: string; chatId?: strin
 }
 
 // ---------------- voice ----------------
-export function speak(text: string) {
-  try {
-    speechSynthesis.cancel();
-    const clean = text.replace(/[*_`#>\[\]]/g, "").replace(/https?:\/\/\S+/g, "a link").slice(0, 600);
-    const u = new SpeechSynthesisUtterance(clean);
-    const want = useSettings.getState().ai.voice;
-    const voices = speechSynthesis.getVoices();
-    const v = voices.find((x) => x.name === want) ?? voices.find((x) => /natural/i.test(x.name) && x.lang.startsWith("en")) ?? voices.find((x) => x.lang.startsWith("en"));
-    if (v) u.voice = v;
-    u.rate = 1.05;
-    speechSynthesis.speak(u);
-  } catch { /* no speech */ }
+let speakGen = 0;
+let audioEl: HTMLAudioElement | null = null;
+
+function cleanForSpeech(text: string) {
+  return text.replace(/[*_`#>\[\]]/g, "").replace(/https?:\/\/\S+/g, "a link").replace(/\s+/g, " ").trim().slice(0, 900);
 }
-export const stopSpeaking = () => { try { speechSynthesis.cancel(); } catch { /* */ } };
+
+/** Split into sentence chunks of at most `max` chars (Orpheus takes ~200 chars per request). */
+function chunkText(t: string, max = 190): string[] {
+  const parts = t.match(/[^.!?]+[.!?]*\s*/g) ?? [t];
+  const out: string[] = [];
+  let cur = "";
+  for (let p of parts) {
+    while (p.length > max) {
+      const cut = p.lastIndexOf(" ", max) > 40 ? p.lastIndexOf(" ", max) : max;
+      if (cur) { out.push(cur.trim()); cur = ""; }
+      out.push(p.slice(0, cut).trim());
+      p = p.slice(cut);
+    }
+    if ((cur + p).length > max) { out.push(cur.trim()); cur = ""; }
+    cur += p;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out.filter(Boolean);
+}
+
+async function groqSpeech(key: string, voice: string, input: string): Promise<Blob> {
+  const r = await fetch("https://api.groq.com/openai/v1/audio/speech", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "canopylabs/orpheus-v1-english", voice, input, response_format: "wav" }),
+  });
+  if (!r.ok) {
+    let msg = `Groq voice error ${r.status}`;
+    try { const j = await r.json(); msg = j?.error?.message ?? msg; } catch { /* */ }
+    throw new Error(msg);
+  }
+  return r.blob();
+}
+
+/** Fish Audio voice id from a raw id or a fish.audio/m/<id> link. */
+export const fishVoiceId = (v: string) => (v.match(/[0-9a-f]{32}/i)?.[0] ?? v.trim());
+
+async function fishSpeech(key: string, voice: string, text: string): Promise<Blob> {
+  const r = await fetch("https://api.fish.audio/v1/tts", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", model: "s1" },
+    body: JSON.stringify({ text, reference_id: fishVoiceId(voice), format: "mp3", latency: "balanced" }),
+  });
+  if (!r.ok) {
+    let msg = `Fish Audio error ${r.status}`;
+    try { const j = await r.json(); msg = j?.message ?? j?.detail ?? msg; } catch { /* */ }
+    if (r.status === 402) msg = "Fish Audio says your account has no API credit left (402).";
+    if (r.status === 401) msg = "Fish Audio rejected the API key (401).";
+    throw new Error(msg);
+  }
+  return r.blob();
+}
+
+function playBlob(b: Blob, gen: number): Promise<void> {
+  return new Promise((res) => {
+    if (gen !== speakGen) return res();
+    const url = URL.createObjectURL(b);
+    const a = new Audio(url);
+    audioEl = a;
+    const done = () => { URL.revokeObjectURL(url); if (audioEl === a) audioEl = null; res(); };
+    a.onended = done;
+    a.onerror = done;
+    a.onpause = done;
+    a.play().catch(done);
+  });
+}
+
+function speakWindows(clean: string) {
+  const u = new SpeechSynthesisUtterance(clean.slice(0, 600));
+  const want = useSettings.getState().ai.voice;
+  const voices = speechSynthesis.getVoices();
+  const v = voices.find((x) => x.name === want) ?? voices.find((x) => /natural/i.test(x.name) && x.lang.startsWith("en")) ?? voices.find((x) => x.lang.startsWith("en"));
+  if (v) u.voice = v;
+  u.rate = 1.05;
+  speechSynthesis.speak(u);
+}
+
+/** Speaks with Groq Orpheus (e.g. "daniel", the Verity voice) when set up, otherwise a Windows voice. */
+export async function speak(text: string) {
+  stopSpeaking();
+  const gen = ++speakGen;
+  const clean = cleanForSpeech(text);
+  if (!clean) return;
+  const { ttsEngine, groqKey, groqVoice, fishKey, fishVoice } = useSettings.getState().ai;
+  if (ttsEngine === "fish" && fishKey && fishVoice) {
+    try {
+      const blob = await fishSpeech(fishKey, fishVoice, clean);
+      if (gen === speakGen) await playBlob(blob, gen);
+      return;
+    } catch (e) {
+      console.warn("Fish Audio voice failed, using Windows voice", e);
+      if (gen !== speakGen) return;
+    }
+  }
+  if (ttsEngine === "groq" && groqKey) {
+    try {
+      const chunks = chunkText(clean);
+      // fetch the next chunk while the current one plays
+      let next = groqSpeech(groqKey, groqVoice || "daniel", chunks[0]);
+      for (let i = 0; i < chunks.length; i++) {
+        const blob = await next;
+        if (gen !== speakGen) return;
+        if (i + 1 < chunks.length) next = groqSpeech(groqKey, groqVoice || "daniel", chunks[i + 1]);
+        await playBlob(blob, gen);
+        if (gen !== speakGen) return;
+      }
+      return;
+    } catch (e) {
+      console.warn("Groq voice failed, using Windows voice", e);
+      if (gen !== speakGen) return;
+    }
+  }
+  try { speakWindows(clean); } catch { /* no speech */ }
+}
+export const stopSpeaking = () => {
+  speakGen++;
+  try { speechSynthesis.cancel(); } catch { /* */ }
+  try { audioEl?.pause(); } catch { /* */ }
+};
+
+/** Speaks a sample line; throws so the setup screen can show the error. */
+export async function testVoice(engine: "groq" | "fish", key: string, voice: string) {
+  stopSpeaking();
+  const gen = ++speakGen;
+  const line = "Hey. I'm here. What do you need?";
+  await playBlob(engine === "fish" ? await fishSpeech(key, voice, line) : await groqSpeech(key, voice, line), gen);
+}
 
 /** Speech → text with Gemini (works whichever provider answers). */
 export async function transcribe(blob: Blob): Promise<string> {
