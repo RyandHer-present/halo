@@ -247,6 +247,7 @@ pub fn run() {
             net::speed_test,
             net::scan_lan,
             net::public_ip,
+            net::tts_request,
             updates::winget_updates,
             updates::winget_upgrade,
             updates::winget_search,

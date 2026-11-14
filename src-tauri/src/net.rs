@@ -272,3 +272,34 @@ pub async fn download(app: &AppHandle, url: &str, dest: &std::path::Path, tag: &
     drop(f);
     std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
 }
+
+/// Text-to-speech request made from Rust, because voice APIs (Fish Audio) block browser
+/// (CORS) requests from the webview. Returns the audio as base64.
+#[tauri::command]
+pub async fn tts_request(url: String, auth: String, body: serde_json::Value, extra_header: Option<(String, String)>) -> Result<String, String> {
+    use base64::Engine;
+    if !(url.starts_with("https://api.fish.audio/") || url.starts_with("https://api.groq.com/")) {
+        return Err("voice service not allowed".into());
+    }
+    let mut req = client().post(&url).bearer_auth(auth).json(&body);
+    if let Some((k, v)) = extra_header {
+        req = req.header(k, v);
+    }
+    let r = req.send().await.map_err(|e| format!("Couldn't reach the voice service: {e}"))?;
+    let status = r.status().as_u16();
+    let bytes = r.bytes().await.map_err(|e| e.to_string())?;
+    if status >= 400 {
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|j| {
+                j.get("message").or(j.get("detail")).or(j.pointer("/error/message")).map(|m| match m {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+            })
+            .unwrap_or_else(|| text.chars().take(200).collect());
+        return Err(format!("{status}: {msg}"));
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}

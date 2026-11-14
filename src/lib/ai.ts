@@ -5,6 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { create } from "zustand";
 import { persist, createJSONStorage, StateStorage } from "zustand/middleware";
 import { LazyStore } from "@tauri-apps/plugin-store";
+import { invoke } from "@tauri-apps/api/core";
 import { api } from "./api";
 import { useSettings, useUi, toast } from "./store";
 import { THEMES } from "./themes";
@@ -871,37 +872,33 @@ function chunkText(t: string, max = 190): string[] {
   return out.filter(Boolean);
 }
 
+async function ttsRequest(url: string, auth: string, body: unknown, mime: string, extra?: [string, string]): Promise<Blob> {
+  const b64 = await invoke<string>("tts_request", { url, auth, body, extraHeader: extra ?? null });
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
 async function groqSpeech(key: string, voice: string, input: string): Promise<Blob> {
-  const r = await fetch("https://api.groq.com/openai/v1/audio/speech", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "canopylabs/orpheus-v1-english", voice, input, response_format: "wav" }),
-  });
-  if (!r.ok) {
-    let msg = `Groq voice error ${r.status}`;
-    try { const j = await r.json(); msg = j?.error?.message ?? msg; } catch { /* */ }
-    throw new Error(msg);
-  }
-  return r.blob();
+  try {
+    return await ttsRequest("https://api.groq.com/openai/v1/audio/speech", key, { model: "canopylabs/orpheus-v1-english", voice, input, response_format: "wav" }, "audio/wav");
+  } catch (e) { throw new Error(`Groq voice: ${e}`); }
 }
 
 /** Fish Audio voice id from a raw id or a fish.audio/m/<id> link. */
 export const fishVoiceId = (v: string) => (v.match(/[0-9a-f]{32}/i)?.[0] ?? v.trim());
 
 async function fishSpeech(key: string, voice: string, text: string): Promise<Blob> {
-  const r = await fetch("https://api.fish.audio/v1/tts", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", model: "s1" },
-    body: JSON.stringify({ text, reference_id: fishVoiceId(voice), format: "mp3", latency: "balanced" }),
-  });
-  if (!r.ok) {
-    let msg = `Fish Audio error ${r.status}`;
-    try { const j = await r.json(); msg = j?.message ?? j?.detail ?? msg; } catch { /* */ }
-    if (r.status === 402) msg = "Fish Audio says your account has no API credit left (402).";
-    if (r.status === 401) msg = "Fish Audio rejected the API key (401).";
-    throw new Error(msg);
+  if (key.startsWith("gsk_")) throw new Error("That is a Groq key (starts with gsk_). Fish Audio needs its own key from fish.audio → API Keys.");
+  try {
+    return await ttsRequest("https://api.fish.audio/v1/tts", key, { text, reference_id: fishVoiceId(voice), format: "mp3", latency: "balanced" }, "audio/mpeg", ["model", "s1"]);
+  } catch (e) {
+    const m = String(e);
+    if (m.startsWith("402")) throw new Error("Fish Audio says your account has no API credit (402). The API needs credit added on fish.audio.");
+    if (m.startsWith("401")) throw new Error("Fish Audio rejected the API key (401). Copy it again from fish.audio → API Keys.");
+    throw new Error(`Fish Audio: ${m}`);
   }
-  return r.blob();
 }
 
 function playBlob(b: Blob, gen: number): Promise<void> {
